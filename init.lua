@@ -1,28 +1,31 @@
 --- === MediaForward ===
 ---
---- Forward volume and media keys from one Mac to another over SSH.
+--- Forward volume and media keys from one Mac to another over HTTP.
 ---
 --- Run in "forwarder" mode on the Mac whose keyboard you're using and
 --- "receiver" mode on the Mac that plays the audio. The forwarder swallows
---- the keys and asks the receiver (via the `hs` CLI over SSH) to replay them
---- as real keypresses, so the native HUD shows and whatever app is playing
---- responds. Hold the local modifier (⌥ by default) on the forwarder to use
---- the keys on that Mac instead.
+--- the keys and sends them to a small HTTP server inside Hammerspoon on the
+--- receiver, which replays them as real keypresses, so the native HUD shows
+--- and whatever app is playing responds. Hold the local modifier (⌥ by
+--- default) on the forwarder to use the keys on that Mac instead.
+---
+--- The receiver only accepts key names from its allow-list, authenticated
+--- with a shared token. Nothing it receives is ever run as code.
 ---
 --- Forwarder:
 ---   hs.loadSpoon("MediaForward")
----   spoon.MediaForward:start({ mode = "forwarder", host = "jayson-m1" })
+---   spoon.MediaForward:start({ mode = "forwarder", host = "jayson-m1", token = "…" })
 ---
---- Receiver (needs the hs CLI installed: hs.ipc.cliInstall()):
+--- Receiver:
 ---   hs.loadSpoon("MediaForward")
----   spoon.MediaForward:start({ mode = "receiver" })
+---   spoon.MediaForward:start({ mode = "receiver", token = "…" })
 
 local obj = {}
 obj.__index = obj
 
 -- Metadata
 obj.name = "MediaForward"
-obj.version = "0.1.0"
+obj.version = "0.2.0"
 obj.author = "Jayson"
 obj.license = "MIT - https://opensource.org/licenses/MIT"
 
@@ -37,16 +40,27 @@ obj.logger = hs.logger.new("MediaForward")
 --- "forwarder" or "receiver". Required.
 obj.mode = nil
 
+--- MediaForward.token
+--- Variable
+--- Shared secret, identical on both Macs. Required. Generate one with
+--- `openssl rand -hex 32`.
+obj.token = nil
+
 --- MediaForward.host
 --- Variable
---- Forwarder only: SSH host of the receiver (an alias from ~/.ssh/config works).
+--- Forwarder only: hostname or IP of the receiver.
 obj.host = nil
 
---- MediaForward.hsPath
+--- MediaForward.port
 --- Variable
---- Forwarder only: path to the `hs` CLI on the receiver. Non-interactive SSH
---- doesn't load your shell PATH, so this must be absolute.
-obj.hsPath = "/opt/homebrew/bin/hs"
+--- TCP port the receiver listens on and the forwarder sends to.
+obj.port = 41414
+
+--- MediaForward.interface
+--- Variable
+--- Receiver only: interface name (e.g. "en0") or IP address to listen on,
+--- such as the receiver's Tailscale IP. nil listens on all interfaces.
+obj.interface = nil
 
 --- MediaForward.localModifier
 --- Variable
@@ -62,31 +76,13 @@ obj.keys = {
   "PLAY", "NEXT", "PREVIOUS", "FAST", "REWIND",
 }
 
---- MediaForward.sshOptions
---- Variable
---- Forwarder only: extra ssh arguments. The defaults keep a persistent control
---- socket open so keypresses don't pay the connection cost.
-obj.sshOptions = {
-  "-o", "BatchMode=yes",            -- never prompt; fail instead of hanging
-  "-o", "ConnectTimeout=3",         -- give up quickly if unreachable
-  "-o", "ControlMaster=auto",       -- create or reuse a shared connection
-  "-o", "ControlPath=~/.ssh/cm-%C", -- socket path (hash of host/user/port)
-  "-o", "ControlPersist=yes",       -- keep the connection open indefinitely
-  "-o", "ServerAliveInterval=30",   -- detect dead connections
-  "-o", "ServerAliveCountMax=2",
-}
-
---- MediaForward.wakeDelay
---- Variable
---- Forwarder only: seconds after wake before re-opening the SSH connection.
-obj.wakeDelay = 5
-
 ---------------------------------------------------------------------------
 -- Internals
 ---------------------------------------------------------------------------
 
 local MARK = 0x564F4C -- tag for events this Spoon posts, so its own tap ignores them
 local userData = hs.eventtap.event.properties.eventSourceUserData
+local TOKEN_HEADER = "X-MediaForward-Token"
 
 local function toSet(list)
   local s = {}
@@ -102,22 +98,44 @@ local function postKey(key, tagged)
   end
 end
 
-function obj:_ssh(remoteCmd)
-  local args = hs.fnutils.concat(hs.fnutils.copy(self.sshOptions), { self.host, remoteCmd })
-  local task = hs.task.new("/usr/bin/ssh", function(code, _, stderr)
-    if code ~= 0 then
-      self.logger.w(string.format("ssh exited %d: %s", code, (stderr or ""):gsub("%s+$", "")))
-    end
-  end, args)
-  if task then task:start() end
+-- Header names aren't guaranteed to keep their case in transit.
+local function header(headers, name)
+  name = name:lower()
+  for k, v in pairs(headers or {}) do
+    if k:lower() == name then return v end
+  end
 end
 
-function obj:_warm()
-  self:_ssh("true")
+-- Compares every byte so the time taken doesn't reveal how much matched.
+local function sameToken(a, b)
+  if type(a) ~= "string" or #a ~= #b then return false end
+  local diff = 0
+  for i = 1, #a do
+    diff = diff | (a:byte(i) ~ b:byte(i))
+  end
+  return diff == 0
 end
 
 function obj:_forward(key)
-  self:_ssh(string.format("%s -c 'spoon.%s:receive(\"%s\")'", self.hsPath, self.name, key))
+  local url = string.format("http://%s:%d/key/%s", self.host, self.port, key)
+  hs.http.asyncPost(url, "", { [TOKEN_HEADER] = self.token }, function(code, body)
+    if code ~= 204 then
+      self.logger.w(string.format("%s → %d %s", key, code, (body or ""):gsub("%s+$", "")))
+    end
+  end)
+end
+
+function obj:_handle(method, path, headers)
+  local plain = { ["Content-Type"] = "text/plain" }
+  if not sameToken(header(headers, TOKEN_HEADER), self.token) then
+    return "bad token", 401, plain
+  end
+  local key = path:match("^/key/([%u_]+)$")
+  if not (key and self._keys[key]) then return "unknown key", 404, plain end
+  if method ~= "POST" then return "use POST", 405, plain end
+
+  postKey(key, false) -- untagged, so the system shows its HUD
+  return "", 204, {}
 end
 
 function obj:_startForwarder()
@@ -138,18 +156,14 @@ function obj:_startForwarder()
     end
     return true
   end):start()
-
-  self._wake = hs.caffeinate.watcher.new(function(ev)
-    if ev == hs.caffeinate.watcher.systemDidWake then
-      hs.timer.doAfter(self.wakeDelay, function() self:_warm() end)
-    end
-  end):start()
-
-  self:_warm()
 end
 
 function obj:_startReceiver()
-  require("hs.ipc") -- lets the hs CLI reach this instance
+  self._server = hs.httpserver.new(false, false)
+    :setPort(self.port)
+    :setCallback(function(method, path, headers) return self:_handle(method, path, headers) end)
+  if self.interface then self._server:setInterface(self.interface) end
+  self._server:start()
 end
 
 ---------------------------------------------------------------------------
@@ -159,13 +173,16 @@ end
 --- MediaForward:start([config]) -> self
 --- Method
 --- Starts in the configured mode. `config` is an optional table of the
---- variables above, e.g. { mode = "forwarder", host = "jayson-m1" }.
+--- variables above, e.g. { mode = "forwarder", host = "jayson-m1", token = "…" }.
 function obj:start(config)
   if config then
     for k, v in pairs(config) do self[k] = v end
   end
   if self._running then self:stop() end
 
+  if type(self.token) ~= "string" or #self.token < 16 then
+    error("MediaForward: `token` must be a string of at least 16 characters")
+  end
   self._keys = toSet(self.keys)
 
   if self.mode == "forwarder" then
@@ -183,10 +200,10 @@ end
 
 --- MediaForward:stop() -> self
 --- Method
---- Stops forwarding (forwarder) or ignores incoming keys (receiver).
+--- Stops forwarding (forwarder) or stops the HTTP server (receiver).
 function obj:stop()
   if self._tap then self._tap:stop(); self._tap = nil end
-  if self._wake then self._wake:stop(); self._wake = nil end
+  if self._server then self._server:stop(); self._server = nil end
   self._running = false
   return self
 end
@@ -212,15 +229,6 @@ end
 function obj:bindHotkeys(mapping)
   hs.spoons.bindHotkeysToSpec({ toggle = hs.fnutils.partial(self.toggle, self) }, mapping)
   return self
-end
-
---- MediaForward:receive(key)
---- Method
---- Receiver only: called over SSH by the forwarder. Replays `key` locally if
---- it's in `keys` and the Spoon is running.
-function obj:receive(key)
-  if not (self._running and self.mode == "receiver") then return end
-  if self._keys[key] then postKey(key, false) end
 end
 
 return obj
