@@ -31,7 +31,10 @@ obj.version = "0.3.0"
 obj.author = "Jayson"
 obj.license = "MIT - https://opensource.org/licenses/MIT"
 
-obj.logger = hs.logger.new("MediaForward")
+-- Info covers start-up and state changes (keys enabled, receiver found,
+-- paired), so it stays quiet; each keypress logs at debug. Use
+-- `spoon.MediaForward.logger.setLogLevel("debug")` to see keypresses too.
+obj.logger = hs.logger.new("MediaForward", "info")
 
 ---------------------------------------------------------------------------
 -- Configuration (set fields directly, or pass a table to :start())
@@ -103,6 +106,8 @@ local function toSet(list)
   return s
 end
 
+local MODIFIER_SYMBOLS = { alt = "⌥", cmd = "⌘", ctrl = "⌃", shift = "⇧", fn = "fn" }
+
 local function postKey(key, tagged)
   for _, down in ipairs({ true, false }) do
     local ev = hs.eventtap.event.newSystemKeyEvent(key, down)
@@ -154,8 +159,12 @@ function obj:_post(path, callback)
 end
 
 function obj:_forward(key)
+  local name = self._target.name
   self:_post("/key/" .. key, function(code, body)
-    if code == 204 then return end
+    if code == 204 then
+      self.logger.d("Forwarded " .. key .. " to " .. name)
+      return
+    end
     self.logger.w(string.format("%s → %d %s", key, code, (body or ""):gsub("%s+$", "")))
     self._paired = false -- keys work locally until the receiver is back
     self:_checkPairing()
@@ -271,6 +280,10 @@ function obj:_startForwarder()
     if k.down then
       local held = self.localModifier and e:getFlags()[self.localModifier]
       if held or not (self._target and self._paired) then
+        local why = held and (MODIFIER_SYMBOLS[self.localModifier] or self.localModifier) .. " held"
+          or self._target and "not paired with " .. self._target.name
+          or "no receiver"
+        self.logger.d("Posted " .. k.key .. " locally (" .. why .. ")")
         postKey(k.key, true)
       else
         self:_forward(k.key)
@@ -334,6 +347,7 @@ function obj:_handle(method, path, headers)
   local key = path:match("^/key/([%u_]+)$")
   if not (key and self._keys[key]) then return "unknown key", 404, plain end
 
+  self.logger.d("Posted " .. key .. " from " .. self._allowed[hash])
   postKey(key, false) -- untagged, so the system shows its HUD
   return "", 204, {}
 end
@@ -381,7 +395,11 @@ function obj:start(config)
   end
 
   self._running = true
-  self.logger.i("started as " .. self.mode)
+  self.logger.i("started as " .. self.mode .. (self.mode == "receiver" and (" on port " .. self.port) or ""))
+  local role = self.mode == "forwarder" and "forwarding" or "receiving"
+  for _, key in ipairs(self.keys) do
+    self.logger.i("Enabled " .. role .. " for " .. key)
+  end
   return self
 end
 

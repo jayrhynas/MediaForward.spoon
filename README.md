@@ -133,6 +133,13 @@ Things to know:
 
 ## Troubleshooting
 
+The Spoon logs to the Hammerspoon console when it starts (one `Enabled forwarding for …` or `Enabled receiving for …` line per key), finds a receiver, or pairs, and warns when a key can't be delivered. Add one of these after `hs.loadSpoon("MediaForward")` to change how much it logs:
+
+```lua
+spoon.MediaForward.logger.setLogLevel("debug")   -- also log every keypress
+spoon.MediaForward.logger.setLogLevel("warning") -- only log problems
+```
+
 - **The forwarder's keys still work locally.** It hasn't found or paired with a receiver yet. Check its Hammerspoon console for `using receiver …`. If that never appears, Bonjour can't see the receiver: check that both Macs are on the same network, or use `host`.
 - **The pairing dialog never appears.** Check the receiver's console for `started as receiver` and the firewall setting. You can see whether it's advertised with `dns-sd -B _mediaforward._tcp`.
 - **The forwarder's keys stopped working locally.** That's expected once it's paired: forwarded keys are swallowed. Hold the `localModifier` key, or stop the Spoon with the toggle hotkey.
