@@ -32,7 +32,13 @@ Both Macs run the same Spoon. One runs in `forwarder` mode and the other in `rec
 
 ## Installation
 
-On both Macs, download this repository and copy `MediaForward.spoon` into `~/.hammerspoon/Spoons/`, or double-click the `.spoon` folder to have Hammerspoon install it.
+On both Macs, clone this repository straight into your Spoons folder:
+
+```sh
+git clone https://github.com/jayrhynas/MediaForward.spoon.git ~/.hammerspoon/Spoons/MediaForward.spoon
+```
+
+Or download it as a ZIP from GitHub. The ZIP unpacks to a folder named `MediaForward.spoon-main`, so rename it to `MediaForward.spoon` first. Then copy it into `~/.hammerspoon/Spoons/`, or double-click it to have Hammerspoon install it. Hammerspoon only recognizes the folder by its `.spoon` extension, and `hs.loadSpoon("MediaForward")` looks for that exact name.
 
 ### Receiver
 
